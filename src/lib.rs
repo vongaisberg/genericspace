@@ -74,20 +74,26 @@ impl Universe {
 
         let mut elems = Vec::new();
 
-    let speed_range = 1.0;
+    let speed_range = 2.0;
 
-        for i in 0..100 {
+        for i in 0..1000 {
             elems.push(PhysicsObject::<f64>::new(
-                [rng.gen_range(50.0, 800.0), rng.gen_range(50.0, 800.0)],
+                [rng.gen_range(250.0, 1200.0), rng.gen_range(250.0, 1200.0)],
                 [rng.gen_range(-speed_range, speed_range), rng.gen_range(-speed_range, speed_range)],
-                rng.gen_range(1.0, 2.0),
+                //rng.gen_range(1.0, 2.0),
+                0.0001
             ))
         }
+        elems.push(PhysicsObject::<f64>::new(
+                [800.0, 500.0],
+                [0.0, 0.0],
+                1.0,
+            ));
 
         Universe {
             phys: PhysicsSpace::new(
                 elems,
-                10f64,
+                100f64,
                 EuclideanSpace::<f64> {
                     field: std::marker::PhantomData::<f64>,
                 },
