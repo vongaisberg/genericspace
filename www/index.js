@@ -51,24 +51,29 @@ var ctx = canvas.getContext("2d");
   avg of last 100 = ${Math.round(mean)}
   min of last 100 = ${Math.round(min)}
   max of last 100 = ${Math.round(max)}
+  particles = ${universe.particle_count()}
   `.trim();
     }
   };
 
   const renderLoop = () => {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-var un = universe.tick();
-for (var i = 0; i < un.length(); i++) {
     
-    ctx.beginPath();
-
-
-   ctx.ellipse(un.get(i).getX(),un.get(i).getY(),2,2,Math.PI / 4, 0, 2 * Math.PI);
-   ctx.fill();
-  // Console.log()
-}
-fps.render();
-requestAnimationFrame(renderLoop);
+    universe.tick();
+    const positions = universe.get_positions();
+    const count = universe.particle_count();
+    
+    for (let i = 0; i < count; i++) {
+        const x = positions[i * 2];
+        const y = positions[i * 2 + 1];
+        
+        ctx.beginPath();
+        ctx.ellipse(x, y, 2, 2, Math.PI / 4, 0, 2 * Math.PI);
+        ctx.fill();
+    }
+    
+    fps.render();
+    requestAnimationFrame(renderLoop);
 }
 
 requestAnimationFrame(renderLoop);

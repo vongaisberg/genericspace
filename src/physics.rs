@@ -1,6 +1,7 @@
+use crate::barnes_hut::{build_tree, QuadTree};
 use crate::types::Field;
 use crate::types::MathSpace;
-use std::ops::{Add, Mul, Sub};
+use num_traits::Pow;
 use wasm_bindgen::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -16,7 +17,6 @@ pub struct PhysicsObject<K: Field> {
 pub enum ObjectStatus {
     Default,
     Deleted,
-    MergedInto(usize),
 }
 
 //WASM logging
@@ -45,195 +45,76 @@ macro_rules! console_log {
 
 
 impl<K: Field> PhysicsObject<K> {
-    fn clone_change_position(&self, pos_vec: [K; 2]) -> PhysicsObject<K> {
-        PhysicsObject {
-            position_vector: pos_vec,
-            direction_vector: self.direction_vector.clone(),
-            mass: self.mass.clone(),
-            acceleration_vector: self.acceleration_vector.clone(),
-            status: self.status,
-        }
-    }
-
-    fn clone_change_direction(&self, dir_vec: [K; 2]) -> PhysicsObject<K> {
-        PhysicsObject {
-            direction_vector: dir_vec,
-            position_vector: self.position_vector.clone(),
-            mass: self.mass.clone(),
-            acceleration_vector: self.acceleration_vector.clone(),
-            status: self.status,
-        }
-    }
-
-    fn clone_change_position_direction(
-        &self,
-        pos_vec: [K; 2],
-        dir_vec: [K; 2],
-    ) -> PhysicsObject<K> {
-        PhysicsObject {
-            direction_vector: dir_vec,
-            position_vector: pos_vec,
-            mass: self.mass.clone(),
-            acceleration_vector: self.acceleration_vector.clone(),
-            status: self.status,
-        }
-    }
-    fn clone_change_status(&self, status: ObjectStatus) -> PhysicsObject<K> {
-        PhysicsObject {
-            direction_vector: self.direction_vector.clone(),
-            position_vector: self.position_vector.clone(),
-            mass: self.mass.clone(),
-            acceleration_vector: self.acceleration_vector.clone(),
-            status: status,
-        }
-    }
-
     pub fn new(position_vector: [K; 2], direction_vector: [K; 2], mass: K) -> Self {
         PhysicsObject {
-            position_vector: position_vector,
-            direction_vector: direction_vector,
-            mass: mass,
+            position_vector,
+            direction_vector,
+            mass,
             acceleration_vector: [K::zero(), K::zero()],
             status: ObjectStatus::Default,
         }
     }
 }
 
-pub struct PhysicsSpace<K: Field + PartialOrd, S: MathSpace<K>> {
+pub struct PhysicsSpace<K: Field + PartialOrd + Pow<f32, Output = K>, S: MathSpace<K>> {
     pub elements: Vec<PhysicsObject<K>>,
     gravitational_constant: K,
     math_space: S,
-    radius: K,  //Elements that are further than K away from [0,0] get deleted
-    epsilon: K, //Small number to fix some numerical errors
-    merge_counter: f64,
+    radius: K,              //Elements that are further than K away from [0,0] get deleted
+    softening_squared: K,   //Softening² parameter to prevent force singularities at close distances
+    theta: f32,             //Barnes-Hut opening angle (0.5-1.0 typical, lower = more accurate)
 }
 
-impl<K: Field + PartialOrd, S: MathSpace<K>> PhysicsSpace<K, S> {
+impl<K: Field + PartialOrd + Pow<f32, Output = K>, S: MathSpace<K>> PhysicsSpace<K, S> {
     pub fn new(
         elements: Vec<PhysicsObject<K>>,
         gravitational_constant: K,
         math_space: S,
         radius: K,
-        epsilon: K,
+        softening: K,
+        theta: f32,
     ) -> Self {
         Self {
-            elements: elements,
-            gravitational_constant: gravitational_constant,
-            math_space: math_space,
-            radius: radius,
-            epsilon: epsilon,
-            merge_counter: 0f64,
+            elements,
+            gravitational_constant,
+            math_space,
+            radius,
+            softening_squared: softening * softening,
+            theta,
         }
     }
 
-    fn leapfrog_integration(&self, obj: &PhysicsObject<K>) -> PhysicsObject<K> {
-       // console_log!("Particle {:?}", obj);
+    #[allow(dead_code)]
+    fn acceleration_direct(&self, e1_pos: &[K; 2], skip_index: usize) -> [K; 2] {
+        let g = self.gravitational_constant;
+        let soft_sq = self.softening_squared;
         
-        let m = &self.math_space;
-       // console_log!("Distance from 00: {:?}", m.distance(&[K::zero(), K::zero()], &obj.position_vector));
-        let zeropointfive = (K::one() + K::one()).inv();
-
-        //x(i+1) = x(i) +v(i) + 0.5 a(i)
-        let next_pos = m.add(
-            &m.add(&obj.position_vector, &obj.direction_vector),
-            &m.mul(&zeropointfive, &obj.acceleration_vector),
-        );
-        //a(i+1)
-        let next_acc = self.acceleration(
-            &obj.clone_change_position(next_pos.clone()),
-            &obj.position_vector,
-        );
-
-        //v(i+1) = v(i) + 0.5( a(i+1) + a(i) )
-        let next_dir = m.add(
-            &obj.direction_vector,
-            &m.mul(&zeropointfive, &m.add(&next_acc, &obj.acceleration_vector)),
-        );
-
-        PhysicsObject {
-            position_vector: next_pos,
-            direction_vector: next_dir,
-            acceleration_vector: next_acc,
-            mass: obj.mass.clone(),
-            status: obj.status,
+        let mut acc = [K::zero(), K::zero()];
+        
+        for (i, e2) in self.elements.iter().enumerate() {
+            // Skip self
+            if i == skip_index {
+                continue;
+            }
+            
+            // Vector from e1 to e2
+            let dx = e2.position_vector[0] - e1_pos[0];
+            let dy = e2.position_vector[1] - e1_pos[1];
+            
+            // Softened distance: r_soft = sqrt(r² + ε²)
+            let dist_sq_soft = dx * dx + dy * dy + soft_sq;
+            let dist_soft = dist_sq_soft.pow(0.5f32);
+            
+            // Plummer softening: a = G * m * (dx, dy) / r_soft³
+            let factor = e2.mass * g * dist_sq_soft.inv() * dist_soft.inv();
+            acc[0] = acc[0] + dx * factor;
+            acc[1] = acc[1] + dy * factor;
         }
+        
+        acc
     }
 
-    fn euler_integration(&self, obj: &PhysicsObject<K>) -> PhysicsObject<K> {
-        let m = &self.math_space;
-        let next_obj =
-            obj.clone_change_position(m.add(&obj.position_vector, &obj.direction_vector));
-        println!(
-            "Acceleration {:?}",
-            &self.acceleration(&next_obj, &obj.position_vector)
-        );
-        next_obj.clone_change_direction(m.add(
-            &next_obj.direction_vector,
-            &self.acceleration(&next_obj, &obj.position_vector),
-        ))
-    }
-
-    fn acceleration(&self, e1: &PhysicsObject<K>, old_pos: &[K; 2]) -> [K; 2] {
-        let m = &self.math_space;
-        self.elements
-            .iter()
-            .map(|e2| {
-                //Calculate the gravity effect on e1 while being attracted by e2
-                let distance = m.distance(&e2.position_vector, &e1.position_vector);
-                let old_distance = m.distance(&e2.position_vector, &old_pos);
-                //           println!("Distance {:?}",distance);
-                if !(distance.is_zero() || old_distance.is_zero()) {
-                    let distance_vector = m.sub(&e2.position_vector, &e1.position_vector);
-                    //             println!("Distance vector {:?}", distance_vector);
-
-                    let distance_unit_vector = m.mul(&distance.clone().inv(), &distance_vector);
-                    //           println!("Distance unit vector {:?}", distance_unit_vector);
-                    let acceleration = e2.mass.clone()
-                        * self.gravitational_constant.clone()
-                        * ((distance.clone() * distance.clone()).inv());
-                    //         println!("Acceleration {:?}", acceleration);
-                    m.mul(&acceleration, &distance_unit_vector)
-                } else {
-                    [K::zero(), K::zero()]
-                }
-            })
-            .fold([K::zero(), K::zero()], |a, acc| m.add(&a, &acc))
-    }
-
-    fn merge(&self, f: &PhysicsObject<K>, s: &PhysicsObject<K>) -> PhysicsObject<K> {
-    //    console_log!("#########################Merging {:?} with {:?}", f, s);
-
-        let m = &self.math_space;
-       let p = PhysicsObject {
-            position_vector: m.mul(
-                &(f.mass.clone() + s.mass.clone()).inv(),
-                &m.add(
-                    &m.mul(&f.mass, &f.position_vector),
-                    &m.mul(&s.mass, &s.position_vector),
-                ),
-            ), // Weighted average of position vectors
-            direction_vector: m.mul(
-                &(f.mass.clone() + s.mass.clone()).inv(),
-                &m.add(
-                    &m.mul(&f.mass, &f.direction_vector),
-                    &m.mul(&s.mass, &s.direction_vector),
-                ),
-            ), //Weighted average of direction vectors
-            acceleration_vector: m.mul(
-                &(f.mass.clone() + s.mass.clone()).inv(),
-                &m.add(
-                    &m.mul(&f.mass, &f.acceleration_vector),
-                    &m.mul(&s.mass, &s.acceleration_vector),
-                ),
-            ),
-        //    acceleration_vector: [K::zero(), K::zero()],
-            status: ObjectStatus::Default,
-            mass: f.mass.clone() + s.mass.clone(), //Sum of masses
-        };
-      //  console_log!("Resulting {:?}", p);
-        p
-    }
-
+    #[allow(dead_code)]
     pub fn print(&self) {
         self.elements.iter().for_each(|e| {
             println!(
@@ -244,79 +125,67 @@ impl<K: Field + PartialOrd, S: MathSpace<K>> PhysicsSpace<K, S> {
     }
 }
 
-impl<K: Field + PartialOrd, S: MathSpace<K>> PhysicsSpace<K, S> {
+/// Specialized implementation for f32 with Barnes-Hut
+impl<S: MathSpace<f32>> PhysicsSpace<f32, S> {
     pub fn tick(&mut self) {
-       // console_log!("Tick ");
         let m = &self.math_space;
-        let mut elements = self.elements.clone();
+        let radius = self.radius;
 
-        for i in 0..elements.len() {
-            //Remove elements that are too far away
-            match elements[i].status {
-                ObjectStatus::Default => {
-                    //Only remove elements that have not been removed or merged
-                    if m.distance(&[K::zero(), K::zero()], &elements[i].position_vector)
-                        > self.radius
-                    {
-                        //  println!("Deleting {:?}", elements[i]);
-                        elements[i].status = ObjectStatus::Deleted
+        // Remove elements that are too far away
+        self.elements.retain(|e| {
+            m.distance(&[0.0, 0.0], &e.position_vector) <= radius
+        });
 
-                    } else {
-                        // If status is still default, check merges
-                        checkMerge(self, &mut elements, i);
-                    }
-                }
-                // If particle A was merged into B, check if other particles would have merged into A. If yes, also merge them into B
-                ObjectStatus::MergedInto(k) => checkMerge(self, &mut elements, i),
-                _ => {}
-            }
-            // {}
-        }
+        // Build Barnes-Hut tree once per frame
+        let tree = build_tree(&self.elements);
 
-        // elements = elements
-        //     .iter()
-        //     .map(|e| match e.status {
-        //         ObjectStatus::MergedInto(f) => e.clone_change_status(ObjectStatus::Default),
-        //         _ => e.clone(),
-        //     })
-        //     .collect();
-        elements.retain(|e| e.status == ObjectStatus::Default);
-
-        fn checkMerge<L: Field + PartialOrd, M: MathSpace<L>>(
-            phys: &PhysicsSpace<L, M>,
-            elements: &mut Vec<PhysicsObject<L>>,
-            i: usize,
-        ) {
-            let m = &phys.math_space;
-            for j in i + 1..phys.elements.len() {
-                // Merge elements that are too close together
-                // Always merge j into i. Update the values of i and mark j as Merged(into)
-
-                if m.distance(&elements[i].position_vector, &elements[j].position_vector)
-                    < phys.epsilon
-                {
-                    match elements[i].status {
-                        ObjectStatus::Default => {
-                            //If i was not merger into anything, merge j into i
-                            elements[i] = phys.merge(&elements[i], &elements[j]);
-                            elements[j].status = ObjectStatus::MergedInto(i);
-                        }
-                        ObjectStatus::MergedInto(k) => {
-                            //If i was merged into k, merge j into k
-
-                            elements[k] = phys.merge(&elements[k], &elements[j]);
-                            elements[j].status = ObjectStatus::MergedInto(k);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-self.elements = elements;
-        self.elements = self.elements
+        // Apply leapfrog integration using Barnes-Hut for acceleration
+        let g = self.gravitational_constant;
+        let soft_sq = self.softening_squared;
+        let theta = self.theta;
+        
+        let updated: Vec<_> = self.elements
             .iter()
-            .map(|e1| self.leapfrog_integration(e1))
+            .enumerate()
+            .map(|(i, obj)| {
+                self.leapfrog_with_tree(obj, i, &tree, g, soft_sq, theta)
+            })
             .collect();
+        self.elements = updated;
+    }
+
+    fn leapfrog_with_tree(
+        &self,
+        obj: &PhysicsObject<f32>,
+        index: usize,
+        tree: &QuadTree,
+        g: f32,
+        soft_sq: f32,
+        theta: f32,
+    ) -> PhysicsObject<f32> {
+        let half = 0.5f32;
+
+        // x(i+1) = x(i) + v(i) + 0.5 * a(i)
+        let next_pos = [
+            obj.position_vector[0] + obj.direction_vector[0] + half * obj.acceleration_vector[0],
+            obj.position_vector[1] + obj.direction_vector[1] + half * obj.acceleration_vector[1],
+        ];
+        
+        // a(i+1) using Barnes-Hut
+        let next_acc = tree.calculate_force(next_pos, theta, g, soft_sq, index);
+
+        // v(i+1) = v(i) + 0.5 * (a(i+1) + a(i))
+        let next_dir = [
+            obj.direction_vector[0] + half * (next_acc[0] + obj.acceleration_vector[0]),
+            obj.direction_vector[1] + half * (next_acc[1] + obj.acceleration_vector[1]),
+        ];
+
+        PhysicsObject {
+            position_vector: next_pos,
+            direction_vector: next_dir,
+            acceleration_vector: next_acc,
+            mass: obj.mass,
+            status: obj.status,
+        }
     }
 }

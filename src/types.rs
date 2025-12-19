@@ -11,6 +11,7 @@ pub trait Field:
     + Inv<Output = Self>
     + std::fmt::Debug
     + Clone
+    + Copy
 {
 }
 
@@ -34,34 +35,25 @@ pub struct EuclideanSpace<K: Field + Pow<f32, Output = K>> {
 
 impl<K: Field + Pow<f32, Output = K>> MathSpace<K> for EuclideanSpace<K> {
     fn distance(&self, first: &[K; 2], second: &[K; 2]) -> K {
-        let diff = self.sub(&second, &first);
-        self.scalar_product(diff.clone(), diff.clone()).pow(0.5f32)
+        let diff = self.sub(second, first);
+        self.scalar_product(diff, diff).pow(0.5f32)
     }
 
     fn add(&self, first: &[K; 2], second: &[K; 2]) -> [K; 2] {
-        [
-            (first[0].clone() + second[0].clone()),
-            (first[1].clone() + second[1].clone()),
-        ]
+        [first[0] + second[0], first[1] + second[1]]
     }
 
     fn sub(&self, first: &[K; 2], second: &[K; 2]) -> [K; 2] {
-        [
-            (first[0].clone() - second[0].clone()),
-            (first[1].clone() - second[1].clone()),
-        ]
+        [first[0] - second[0], first[1] - second[1]]
     }
 
     fn mul(&self, scalar: &K, vector: &[K; 2]) -> [K; 2] {
-        [
-            (scalar.clone() * vector[0].clone()),
-            (scalar.clone() * vector[1].clone()),
-        ]
+        [*scalar * vector[0], *scalar * vector[1]]
     }
 }
 
 impl<K: Field + Pow<f32, Output = K>> EuclideanSpace<K> {
     fn scalar_product(&self, first: [K; 2], second: [K; 2]) -> K {
-        (first[0].clone() * second[0].clone()) + (first[1].clone() * second[1].clone())
+        first[0] * second[0] + first[1] * second[1]
     }
 }
